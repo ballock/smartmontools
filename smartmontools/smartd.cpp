@@ -21,282 +21,27 @@
  *
  */
 
-#include "config.h"
-#include "int64.h"
-
-// unconditionally included files
-#include <stdio.h>
-#include <sys/types.h>
-#include <sys/stat.h>   // umask
-#include <signal.h>
-#include <fcntl.h>
-#include <string.h>
-#include <syslog.h>
-#include <stdarg.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <time.h>
-#include <limits.h>
-#include <getopt.h>
-
-#include <stdexcept>
-#include <string>
-#include <vector>
-#include <algorithm> // std::replace()
-
-// conditionally included files
-#ifndef _WIN32
-#include <sys/wait.h>
-#endif
-#ifdef HAVE_UNISTD_H
-#include <unistd.h>
-#endif
-#ifdef HAVE_NETDB_H
-#include <netdb.h>
-#endif
-
-#ifdef _WIN32
-#ifdef _MSC_VER
-#pragma warning(disable:4761) // "conversion supplied"
-typedef unsigned short mode_t;
-typedef int pid_t;
-#endif
-#include <io.h> // umask()
-#include <process.h> // getpid()
-#endif // _WIN32
-
-#ifdef __CYGWIN__
-#include <io.h> // setmode()
-#endif // __CYGWIN__
-
-#ifdef HAVE_LIBCAP_NG
-#include <cap-ng.h>
-#endif // LIBCAP_NG
-
-// locally included files
-#include "atacmds.h"
-#include "dev_interface.h"
-#include "knowndrives.h"
-#include "scsicmds.h"
-#include "utility.h"
-
-// This is for solaris, where signal() resets the handler to SIG_DFL
-// after the first signal is caught.
-#ifdef HAVE_SIGSET
-#define SIGNALFN sigset
-#else
-#define SIGNALFN signal
-#endif
-
-#ifdef _WIN32
-// fork()/signal()/initd simulation for native Windows
-#include "daemon_win32.h" // daemon_main/detach/signal()
-#undef SIGNALFN
-#define SIGNALFN  daemon_signal
-#define strsignal daemon_strsignal
-#define sleep     daemon_sleep
-// SIGQUIT does not exist, CONTROL-Break signals SIGBREAK.
-#define SIGQUIT SIGBREAK
-#define SIGQUIT_KEYNAME "CONTROL-Break"
-#else  // _WIN32
-#define SIGQUIT_KEYNAME "CONTROL-\\"
-#endif // _WIN32
-
-#if defined (__SVR4) && defined (__sun)
-extern "C" int getdomainname(char *, int); // no declaration in header files!
-#endif
+#include "smartd.h"
 
 const char * smartd_cpp_cvsid = "$Id$"
   CONFIG_H_CVSID;
 
-// smartd exit codes
-#define EXIT_BADCMD    1   // command line did not parse
-#define EXIT_BADCONF   2   // syntax error in config file
-#define EXIT_STARTUP   3   // problem forking daemon
-#define EXIT_PID       4   // problem creating pid file
-#define EXIT_NOCONF    5   // config file does not exist
-#define EXIT_READCONF  6   // config file exists but cannot be read
-
-#define EXIT_NOMEM     8   // out of memory
-#define EXIT_BADCODE   10  // internal error - should NEVER happen
-
-#define EXIT_BADDEV    16  // we can't monitor this device
-#define EXIT_NODEV     17  // no devices to monitor
-
-#define EXIT_SIGNAL    254 // abort on signal
-
-
-// command-line: 1=debug mode, 2=print presets
-static unsigned char debugmode = 0;
-
-// command-line: how long to sleep between checks
-#define CHECKTIME 1800
-static int checktime=CHECKTIME;
-
-// command-line: name of PID file (empty for no pid file)
-static std::string pid_file;
-
-// command-line: path prefix of persistent state file, empty if no persistence.
-static std::string state_path_prefix
-#ifdef SMARTMONTOOLS_SAVESTATES
-          = SMARTMONTOOLS_SAVESTATES
-#endif
-                                    ;
-
-// command-line: path prefix of attribute log file, empty if no logs.
-static std::string attrlog_path_prefix
-#ifdef SMARTMONTOOLS_ATTRIBUTELOG
-          = SMARTMONTOOLS_ATTRIBUTELOG
-#endif
-                                    ;
-
-// configuration file name
-static const char * configfile;
-// configuration file "name" if read from stdin
-static const char * const configfile_stdin = "<stdin>";
-// path of alternate configuration file
-static std::string configfile_alt;
-
-// warning script file
-static std::string warning_script;
-
-// command-line: when should we exit?
-static int quit=0;
-
-// command-line; this is the default syslog(3) log facility to use.
-static int facility=LOG_DAEMON;
-
-#ifndef _WIN32
-// command-line: fork into background?
-static bool do_fork=true;
-#endif
-
-#ifdef HAVE_LIBCAP_NG
-// command-line: enable capabilities?
-static bool enable_capabilities = false;
-#endif
-
 // TODO: This smartctl only variable is also used in os_win32.cpp
 unsigned char failuretest_permissive = 0;
 
-// set to one if we catch a USR1 (check devices now)
-static volatile int caughtsigUSR1=0;
-
-#ifdef _WIN32
-// set to one if we catch a USR2 (toggle debug mode)
-static volatile int caughtsigUSR2=0;
-#endif
-
-// set to one if we catch a HUP (reload config file). In debug mode,
-// set to two, if we catch INT (also reload config file).
-static volatile int caughtsigHUP=0;
-
-// set to signal value if we catch INT, QUIT, or TERM
-static volatile int caughtsigEXIT=0;
-
-// This function prints either to stdout or to the syslog as needed.
-static void PrintOut(int priority, const char *fmt, ...)
-                     __attribute_format_printf(2, 3);
-
-// Attribute monitoring flags.
-// See monitor_attr_flags below.
-enum {
-  MONITOR_IGN_FAILUSE = 0x01,
-  MONITOR_IGNORE      = 0x02,
-  MONITOR_RAW_PRINT   = 0x04,
-  MONITOR_RAW         = 0x08,
-  MONITOR_AS_CRIT     = 0x10,
-  MONITOR_RAW_AS_CRIT = 0x20,
-};
 
 // Array of flags for each attribute.
-class attribute_flags
-{
-public:
-  attribute_flags()
+attribute_flags::attribute_flags()
     { memset(m_flags, 0, sizeof(m_flags)); }
 
-  bool is_set(int id, unsigned char flag) const
+bool attribute_flags::is_set(int id, unsigned char flag) const
     { return (0 < id && id < (int)sizeof(m_flags) && (m_flags[id] & flag)); }
 
-  void set(int id, unsigned char flags)
+void attribute_flags::set(int id, unsigned char flags)
     {
       if (0 < id && id < (int)sizeof(m_flags))
         m_flags[id] |= flags;
     }
-
-private:
-  unsigned char m_flags[256];
-};
-
-
-/// Configuration data for a device. Read from smartd.conf.
-/// Supports copy & assignment and is compatible with STL containers.
-struct dev_config
-{
-  int lineno;                             // Line number of entry in file
-  std::string name;                       // Device name (with optional extra info)
-  std::string dev_name;                   // Device name (plain, for SMARTD_DEVICE variable)
-  std::string dev_type;                   // Device type argument from -d directive, empty if none
-  std::string dev_idinfo;                 // Device identify info for warning emails
-  std::string state_file;                 // Path of the persistent state file, empty if none
-  std::string attrlog_file;               // Path of the persistent attrlog file, empty if none
-  bool ignore;                            // Ignore this entry
-  bool smartcheck;                        // Check SMART status
-  bool usagefailed;                       // Check for failed Usage Attributes
-  bool prefail;                           // Track changes in Prefail Attributes
-  bool usage;                             // Track changes in Usage Attributes
-  bool selftest;                          // Monitor number of selftest errors
-  bool errorlog;                          // Monitor number of ATA errors
-  bool xerrorlog;                         // Monitor number of ATA errors (Extended Comprehensive error log)
-  bool offlinests;                        // Monitor changes in offline data collection status
-  bool offlinests_ns;                     // Disable auto standby if in progress
-  bool selfteststs;                       // Monitor changes in self-test execution status
-  bool selfteststs_ns;                    // Disable auto standby if in progress
-  bool permissive;                        // Ignore failed SMART commands
-  char autosave;                          // 1=disable, 2=enable Autosave Attributes
-  char autoofflinetest;                   // 1=disable, 2=enable Auto Offline Test
-  firmwarebug_defs firmwarebugs;          // -F directives from drivedb or smartd.conf
-  bool ignorepresets;                     // Ignore database of -v options
-  bool showpresets;                       // Show database entry for this device
-  bool removable;                         // Device may disappear (not be present)
-  char powermode;                         // skip check, if disk in idle or standby mode
-  bool powerquiet;                        // skip powermode 'skipping checks' message
-  int powerskipmax;                       // how many times can be check skipped
-  unsigned char tempdiff;                 // Track Temperature changes >= this limit
-  unsigned char tempinfo, tempcrit;       // Track Temperatures >= these limits as LOG_INFO, LOG_CRIT+mail
-  regular_expression test_regex;          // Regex for scheduled testing
-
-  // Configuration of email warning messages
-  std::string emailcmdline;               // script to execute, empty if no messages
-  std::string emailaddress;               // email address, or empty
-  unsigned char emailfreq;                // Emails once (1) daily (2) diminishing (3)
-  bool emailtest;                         // Send test email?
-
-  // ATA ONLY
-  int dev_rpm; // rotation rate, 0 = unknown, 1 = SSD, >1 = HDD
-  int set_aam; // disable(-1), enable(1..255->0..254) Automatic Acoustic Management
-  int set_apm; // disable(-1), enable(2..255->1..254) Advanced Power Management
-  int set_lookahead; // disable(-1), enable(1) read look-ahead
-  int set_standby; // set(1..255->0..254) standby timer
-  bool set_security_freeze; // Freeze ATA security
-  int set_wcache; // disable(-1), enable(1) write cache
-
-  bool sct_erc_set;                       // set SCT ERC to:
-  unsigned short sct_erc_readtime;        // ERC read time (deciseconds)
-  unsigned short sct_erc_writetime;       // ERC write time (deciseconds)
-
-  unsigned char curr_pending_id;          // ID of current pending sector count, 0 if none
-  unsigned char offl_pending_id;          // ID of offline uncorrectable sector count, 0 if none
-  bool curr_pending_incr, offl_pending_incr; // True if current/offline pending values increase
-  bool curr_pending_set,  offl_pending_set;  // True if '-C', '-U' set in smartd.conf
-
-  attribute_flags monitor_attr_flags;     // MONITOR_* flags for each attribute
-
-  ata_vendor_attr_defs attribute_defs;    // -v options
-
-  dev_config();
-};
 
 dev_config::dev_config()
 : lineno(0),
@@ -337,71 +82,6 @@ dev_config::dev_config()
 {
 }
 
-
-// Number of allowed mail message types
-static const int SMARTD_NMAIL = 13;
-// Type for '-M test' mails (state not persistent)
-static const int MAILTYPE_TEST = 0;
-// TODO: Add const or enum for all mail types.
-
-struct mailinfo {
-  int logged;// number of times an email has been sent
-  time_t firstsent;// time first email was sent, as defined by time(2)
-  time_t lastsent; // time last email was sent, as defined by time(2)
-
-  mailinfo()
-    : logged(0), firstsent(0), lastsent(0) { }
-};
-
-/// Persistent state data for a device.
-struct persistent_dev_state
-{
-  unsigned char tempmin, tempmax;         // Min/Max Temperatures
-
-  unsigned char selflogcount;             // total number of self-test errors
-  unsigned short selfloghour;             // lifetime hours of last self-test error
-
-  time_t scheduled_test_next_check;       // Time of next check for scheduled self-tests
-
-  uint64_t selective_test_last_start;     // Start LBA of last scheduled selective self-test
-  uint64_t selective_test_last_end;       // End LBA of last scheduled selective self-test
-
-  mailinfo maillog[SMARTD_NMAIL];         // log info on when mail sent
-
-  // ATA ONLY
-  int ataerrorcount;                      // Total number of ATA errors
-
-  // Persistent part of ata_smart_values:
-  struct ata_attribute {
-    unsigned char id;
-    unsigned char val;
-    unsigned char worst; // Byte needed for 'raw64' attribute only.
-    uint64_t raw;
-    unsigned char resvd;
-
-    ata_attribute() : id(0), val(0), worst(0), raw(0), resvd(0) { }
-  };
-  ata_attribute ata_attributes[NUMBER_ATA_SMART_ATTRIBUTES];
-  
-  // SCSI ONLY
-
-  struct scsi_error_counter {
-    struct scsiErrorCounter errCounter;
-    unsigned char found;
-    scsi_error_counter() : found(0) { }
-  };
-  scsi_error_counter scsi_error_counters[3];
-
-  struct scsi_nonmedium_error {
-    struct scsiNonMediumError nme;
-    unsigned char found;
-    scsi_nonmedium_error() : found(0) { }
-  };
-  scsi_nonmedium_error scsi_nonmedium_error;
-
-  persistent_dev_state();
-};
-
 persistent_dev_state::persistent_dev_state()
 : tempmin(0), tempmax(0),
   selflogcount(0),
@@ -412,43 +92,6 @@ persistent_dev_state::persistent_dev_state()
   ataerrorcount(0)
 {
 }
-
-/// Non-persistent state data for a device.
-struct temp_dev_state
-{
-  bool must_write;                        // true if persistent part should be written
-
-  bool not_cap_offline;                   // true == not capable of offline testing
-  bool not_cap_conveyance;
-  bool not_cap_short;
-  bool not_cap_long;
-  bool not_cap_selective;
-
-  unsigned char temperature;              // last recorded Temperature (in Celsius)
-  time_t tempmin_delay;                   // time where Min Temperature tracking will start
-
-  bool powermodefail;                     // true if power mode check failed
-  int powerskipcnt;                       // Number of checks skipped due to idle or standby mode
-
-  // SCSI ONLY
-  unsigned char SmartPageSupported;       // has log sense IE page (0x2f)
-  unsigned char TempPageSupported;        // has log sense temperature page (0xd)
-  unsigned char ReadECounterPageSupported;
-  unsigned char WriteECounterPageSupported;
-  unsigned char VerifyECounterPageSupported;
-  unsigned char NonMediumErrorPageSupported;
-  unsigned char SuppressReport;           // minimize nuisance reports
-  unsigned char modese_len;               // mode sense/select cmd len: 0 (don't
-                                          // know yet) 6 or 10
-  // ATA ONLY
-  uint64_t num_sectors;                   // Number of sectors
-  ata_smart_values smartval;              // SMART data
-  ata_smart_thresholds_pvt smartthres;    // SMART thresholds
-  bool offline_started;                   // true if offline data collection was started
-  bool selftest_started;                  // true if self-test was started
-
-  temp_dev_state();
-};
 
 temp_dev_state::temp_dev_state()
 : must_write(false),
@@ -476,21 +119,6 @@ temp_dev_state::temp_dev_state()
   memset(&smartval, 0, sizeof(smartval));
   memset(&smartthres, 0, sizeof(smartthres));
 }
-
-/// Runtime state data for a device.
-struct dev_state
-: public persistent_dev_state,
-  public temp_dev_state
-{
-  void update_persistent_state();
-  void update_temp_state();
-};
-
-/// Container for configuration info for each device.
-typedef std::vector<dev_config> dev_config_vector;
-
-/// Container for state info for each device.
-typedef std::vector<dev_state> dev_state_vector;
 
 // Copy ATA attributes to persistent state.
 void dev_state::update_persistent_state()
@@ -795,7 +423,7 @@ static bool write_dev_attrlog(const char * path, const dev_state & state)
 // unless must_write is set.
 static void write_all_dev_states(const dev_config_vector & configs,
                                  dev_state_vector & states,
-                                 bool write_always = true)
+                                 bool write_always)
 {
   for (unsigned i = 0; i < states.size(); i++) {
     const dev_config & cfg = configs.at(i);
@@ -894,30 +522,6 @@ static int Goodbye(int status)
   return status;
 }
 
-// a replacement for setenv() which is not available on all platforms.
-// Note that the string passed to putenv must not be freed or made
-// invalid, since a pointer to it is kept by putenv(). This means that
-// it must either be a static buffer or allocated off the heap. The
-// string can be freed if the environment variable is redefined via
-// another call to putenv(). There is no portable way to unset a variable
-// with putenv(). So we manage the buffer in a static object.
-// Using setenv() if available is not considered because some
-// implementations may produce memory leaks.
-
-class env_buffer
-{
-public:
-  env_buffer()
-    : m_buf((char *)0) { }
-
-  void set(const char * name, const char * value);
-
-private:
-  char * m_buf;
-
-  env_buffer(const env_buffer &);
-  void operator=(const env_buffer &);
-};
 
 void env_buffer::set(const char * name, const char * value)
 {
@@ -933,10 +537,6 @@ void env_buffer::set(const char * name, const char * value)
   m_buf = newbuf;
 }
 
-#define EBUFLEN 1024
-
-static void MailWarning(const dev_config & cfg, dev_state & state, int which, const char *fmt, ...)
-                        __attribute_format_printf(4, 5);
 
 // If either address or executable path is non-null then send and log
 // a warning email, or execute executable
@@ -1165,9 +765,6 @@ static void MailWarning(const dev_config & cfg, dev_state & state, int which, co
 }
 
 static void reset_warning_mail(const dev_config & cfg, dev_state & state, int which, const char *fmt, ...)
-                               __attribute_format_printf(4, 5);
-
-static void reset_warning_mail(const dev_config & cfg, dev_state & state, int which, const char *fmt, ...)
 {
   if (!(0 <= which && which < SMARTD_NMAIL))
     return;
@@ -1208,9 +805,6 @@ static void vsyslog_lines(int priority, const char * fmt, va_list ap)
   }
 }
 
-#else  // _WIN32
-// os_win32/syslog_win32.cpp supports multiple lines.
-#define vsyslog_lines vsyslog
 #endif // _WIN32
 
 // Printing function for watching ataprint commands, or losing them
@@ -1616,8 +1210,6 @@ static int SelfTestErrorCount(ata_device * device, const char * name,
   return ataPrintSmartSelfTestlog(&log, false, firmwarebugs);
 }
 
-#define SELFTEST_ERRORCOUNT(x) (x & 0xff)
-#define SELFTEST_ERRORHOURS(x) ((x >> 8) & 0xffff)
 
 // Check offline data collection status
 static inline bool is_offl_coll_in_progress(unsigned char status)
@@ -1725,7 +1317,7 @@ static void finish_device_scan(dev_config & cfg, dev_state & state)
 
 // Common function to format result message for ATA setting
 static void format_set_result_msg(std::string & msg, const char * name, bool ok,
-                                  int set_option = 0, bool has_value = false)
+                                  int set_option, bool has_value)
 {
   if (!msg.empty())
     msg += ", ";
@@ -1740,9 +1332,6 @@ static void format_set_result_msg(std::string & msg, const char * name, bool ok,
     msg += ":on";
 }
 
-
-// TODO: Add '-F swapid' directive
-const bool fix_swapped_id = false;
 
 // scan to see what ata devices there are, and if they support SMART
 static int ATADeviceScan(dev_config & cfg, dev_state & state, ata_device * atadev)
@@ -2454,13 +2043,9 @@ static void CheckSelfTestLogs(const dev_config & cfg, dev_state & state, int new
   return;
 }
 
-// Test types, ordered by priority.
-static const char test_type_chars[] = "LncrSCO";
-static const unsigned num_test_types = sizeof(test_type_chars)-1;
-
 // returns test type if time to do test of type testtype,
 // 0 if not time to do test.
-static char next_scheduled_test(const dev_config & cfg, dev_state & state, bool scsi, time_t usetime = 0)
+static char next_scheduled_test(const dev_config & cfg, dev_state & state, bool scsi, time_t usetime)
 {
   // check that self-testing has been requested
   if (cfg.test_regex.empty())
@@ -2891,13 +2476,13 @@ static void CheckTemperature(const dev_config & cfg, dev_state & state, unsigned
       reset_warning_mail(cfg, state, 12, "Temperature %u Celsius dropped below %u Celsius", currtemp, limit);
   }
 }
-
+//#TODO This used to be static. Why? hah
 // Check normalized and raw attribute values.
-static void check_attribute(const dev_config & cfg, dev_state & state,
-                            const ata_smart_attribute & attr,
-                            const ata_smart_attribute & prev,
-                            int attridx,
-                            const ata_smart_threshold_entry * thresholds)
+void check_attribute(const dev_config & cfg, dev_state & state,
+                      const ata_smart_attribute & attr,
+                      const ata_smart_attribute & prev,
+                      int attridx,
+                      const ata_smart_threshold_entry * thresholds)
 {
   // Check attribute and threshold
   ata_attr_state attrstate = ata_get_attr_state(attr, attridx, thresholds, cfg.attribute_defs);
@@ -3303,9 +2888,6 @@ static int SCSICheckDevice(const dev_config & cfg, dev_state & state, scsi_devic
     return 0;
 }
 
-// 0=not used, 1=not disabled, 2=disable rejected by OS, 3=disabled
-static int standby_disable_state = 0;
-
 static void init_disable_standby_check(dev_config_vector & configs)
 {
   // Check for '-l offlinests,ns' or '-l selfteststs,ns' directives
@@ -3397,9 +2979,6 @@ static void CheckDevicesOnce(const dev_config_vector & configs, dev_state_vector
 
   do_disable_standby_check(configs, states);
 }
-
-// Set if Initialize() was called
-static bool is_initialized = false;
 
 // Does initialization right after fork to daemon mode
 static void Initialize(time_t *wakeuptime)
@@ -3569,7 +3148,7 @@ static void printoutvaliddirectiveargs(int priority, char d)
 
 // exits with an error message, or returns integer value of token
 static int GetInteger(const char *arg, const char *name, const char *token, int lineno, const char *cfgfile,
-               int min, int max, char * suffix = 0)
+               int min, int max, char * suffix)
 {
   // make sure argument is there
   if (!arg) {
@@ -4118,8 +3697,6 @@ static int ParseToken(char * token, dev_config & cfg)
   return 1;
 }
 
-// Scan directive for configuration file
-#define SCANDIRECTIVE "DEVICESCAN"
 
 // This is the routine that adds things to the conf_entries list.
 //
@@ -4441,6 +4018,8 @@ static void ParseOpts(int argc, char **argv)
   };
 
   opterr=optopt=0;
+  debugmode = 0;
+  checktime = CHECKTIME;
   bool badarg = false;
   bool no_defaultdb = false; // set true on '-B FILE'
 

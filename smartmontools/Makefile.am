@@ -118,6 +118,7 @@ endif
 
 
 smartd_SOURCES = \
+        smartd.h \
         smartd.cpp \
         atacmdnames.cpp \
         atacmdnames.h \
